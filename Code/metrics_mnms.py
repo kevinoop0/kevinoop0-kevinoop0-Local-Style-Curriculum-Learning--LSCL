@@ -1,0 +1,581 @@
+import os
+import re
+import glob
+import time
+import argparse
+import numpy as np
+import pandas as pd
+import nibabel as nib
+from medpy.metric.binary import hd, dc, jc, assd
+
+import matplotlib
+matplotlib.use("agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import ipdb
+import csv
+
+HEADER = ["Name", "ED/ES", "Vendor", "Centre", 
+          "Dice LV", "Jaccard LV", "Hausdorff LV", "ASSD LV",
+          "Dice MYO", "Jaccard MYO", "Hausdorff MYO", "ASSD MYO",
+          "Dice RV", "Jaccard RV", "Hausdorff RV", "ASSD RV"]
+
+#
+# Utils functions used to sort strings into a natural order
+#
+def conv_int(i):
+    return int(i) if i.isdigit() else i
+
+
+def natural_order(sord):
+    """
+    Sort a (list,tuple) of strings into natural order.
+
+    Ex:
+
+    ['1','10','2'] -> ['1','2','10']
+
+    ['abc1def','ab10d','b2c','ab1d'] -> ['ab1d','ab10d', 'abc1def', 'b2c']
+
+    """
+    if isinstance(sord, tuple):
+        sord = sord[0]
+    return [conv_int(c) for c in re.split(r'(\d+)', sord)]
+
+
+# code
+def mod_dc(result, reference):
+    r"""
+    Dice coefficient
+    
+    Computes the Dice coefficient (also known as Sorensen index) between the binary
+    objects in two images.
+    
+    The metric is defined as
+    
+    .. math::
+        
+        DC=\frac{2|A\cap B|}{|A|+|B|}
+        
+    , where :math:`A` is the first and :math:`B` the second set of samples (here: binary objects).
+    
+    Parameters
+    ----------
+    result : array_like
+        Input data containing objects. Can be any type but will be converted
+        into binary: background where 0, object everywhere else.
+    reference : array_like
+        Input data containing objects. Can be any type but will be converted
+        into binary: background where 0, object everywhere else.
+    
+    Returns
+    -------
+    dc : float
+        The Dice coefficient between the object(s) in ```result``` and the
+        object(s) in ```reference```. It ranges from 0 (no overlap) to 1 (perfect overlap).
+        
+    Notes
+    -----
+    This is a real metric. The binary images can therefore be supplied in any order.
+    """
+    result = np.atleast_1d(result.astype(np.bool))
+    reference = np.atleast_1d(reference.astype(np.bool))
+    
+    intersection = np.count_nonzero(result & reference)
+    
+    size_i1 = np.count_nonzero(result)
+    size_i2 = np.count_nonzero(reference)
+    
+    try:
+        dc = 2. * intersection / float(size_i1 + size_i2)
+    except ZeroDivisionError:
+        dc = 1.0
+        
+    return dc
+
+
+# code
+def mod_jc(result, reference):
+    r"""
+    Jaccard index
+    """
+    result = np.atleast_1d(result.astype(np.bool))
+    reference = np.atleast_1d(reference.astype(np.bool))
+
+    intersection = np.count_nonzero(result & reference)
+    union = np.count_nonzero(result | reference)
+
+    try:
+        jc = float(intersection) / float(union)
+    except ZeroDivisionError:
+        jc = 1.0
+
+    return jc
+
+#
+# Utils function to load and save nifti files with the nibabel package
+#
+def load_nii(img_path):
+    """
+    Function to load a 'nii' or 'nii.gz' file, The function returns
+    everyting needed to save another 'nii' or 'nii.gz'
+    in the same dimensional space, i.e. the affine matrix and the header
+
+    Parameters
+    ----------
+
+    img_path: string
+    String with the path of the 'nii' or 'nii.gz' image file name.
+
+    Returns
+    -------
+    Three element, the first is a numpy array of the image values,
+    the second is the affine transformation of the image, and the
+    last one is the header of the image.
+    """
+    nimg = nib.load(img_path)
+    return nimg.get_fdata().squeeze(), nimg.affine, nimg.header
+
+
+def save_nii(img_path, data, affine, header):
+    """
+    Function to save a 'nii' or 'nii.gz' file.
+
+    Parameters
+    ----------
+
+    img_path: string
+    Path to save the image should be ending with '.nii' or '.nii.gz'.
+
+    data: np.array
+    Numpy array of the image data.
+
+    affine: list of list or np.array
+    The affine transformation to save with the image.
+
+    header: nib.Nifti1Header
+    The header that define everything about the data
+    (pleasecheck nibabel documentation).
+    """
+    nimg = nib.Nifti1Image(data, affine=affine, header=header)
+    nimg.to_filename(img_path)
+
+
+#
+# Functions to process files, directories and metrics
+#
+def metrics(img_gt, img_pred, voxel_size, flag=False):
+    """
+    Function to compute the metrics between two segmentation maps given as input.
+
+    Parameters
+    ----------
+    img_gt: np.array
+    Array of the ground truth segmentation map.
+
+    img_pred: np.array
+    Array of the predicted segmentation map.
+
+    voxel_size: list, tuple or np.array
+    The size of a voxel of the images used to compute the volumes.
+
+    Return
+    ------
+    A list of metrics in this order, [Dice LV, Volume LV, Err LV(ml),
+    Dice RV, Volume RV, Err RV(ml), Dice MYO, Volume MYO, Err MYO(ml)]
+    """
+
+    if img_gt.ndim != img_pred.ndim:
+        raise ValueError("The arrays 'img_gt' and 'img_pred' should have the "
+                         "same dimension, {} against {}".format(img_gt.ndim,
+                                                                img_pred.ndim))
+
+    res = []
+    # Loop on each classes of the input images
+    # for c in [3, 1, 2]:
+    for c in [1, 2, 3]:
+        # Copy the gt image to not alterate the input
+        gt_c_i = np.copy(img_gt)
+        gt_c_i[gt_c_i != c] = 0
+
+        # Copy the pred image to not alterate the input
+        pred_c_i = np.copy(img_pred)
+        pred_c_i[pred_c_i != c] = 0
+
+        # Clip the value to compute the volumes
+        gt_c_i = np.clip(gt_c_i, 0, 1)
+        pred_c_i = np.clip(pred_c_i, 0, 1)
+
+        # Compute the Dice
+        if flag:
+            res += [dc(pred_c_i, gt_c_i)]
+        else:
+            dice = dc(pred_c_i, gt_c_i)
+
+            # Compute the Jaccard
+            jaccard = jc(pred_c_i, gt_c_i)
+
+            _sum = np.sum(pred_c_i)
+            # Compute Hausdorff
+            if _sum > 0:
+                hausd = hd(pred_c_i, gt_c_i, voxel_size)
+            else:
+                hausd = -1
+
+            # Compute the ASSD
+            if _sum > 0:
+                surfdist = assd(pred_c_i, gt_c_i, voxel_size)
+            else:
+                surfdist = -1
+
+            res += [dice, jaccard, hausd, surfdist]
+
+    return res
+
+
+#
+# Functions to process files, directories and metrics
+#
+def metrics_slice(img_gt, img_pred, voxel_size):
+    """
+    Function to compute the metrics between two segmentation maps given as input.
+
+    Parameters
+    ----------
+    img_gt: np.array
+    Array of the ground truth segmentation map.
+
+    img_pred: np.array
+    Array of the predicted segmentation map.
+
+    voxel_size: list, tuple or np.array
+    The size of a voxel of the images used to compute the volumes.
+
+    Return
+    ------
+    A list of metrics in this order, [Dice LV, Volume LV, Err LV(ml),
+    Dice RV, Volume RV, Err RV(ml), Dice MYO, Volume MYO, Err MYO(ml)]
+    """
+
+    if img_gt.ndim != img_pred.ndim:
+        raise ValueError("The arrays 'img_gt' and 'img_pred' should have the "
+                         "same dimension, {} against {}".format(img_gt.ndim,
+                                                                img_pred.ndim))
+
+    res_zs = []
+    for zz in range(img_gt.shape[2]):
+        res_z = []
+        # Loop on each classes of the input images
+        for c in [1, 2, 3]:
+            # Copy the gt image to not alterate the input
+            gt_c_i = np.copy(img_gt[..., zz])
+            gt_c_i[gt_c_i != c] = 0
+
+            # Copy the pred image to not alterate the input
+            try:
+                pred_c_i = np.copy(img_pred[..., zz])
+            except:
+                ipdb.set_trace()
+            pred_c_i[pred_c_i != c] = 0
+
+            # Clip the value to compute the volumes
+            gt_c_i = np.clip(gt_c_i, 0, 1)
+            pred_c_i = np.clip(pred_c_i, 0, 1)
+
+
+            # Compute the Dice
+            dice = mod_dc(pred_c_i, gt_c_i)
+
+            # Compute the Jaccard
+            jaccard = mod_jc(pred_c_i, gt_c_i)
+
+            _sum1 = np.sum(pred_c_i)
+            _sum2 = np.sum(gt_c_i)
+            # Compute Hausdorff
+            if _sum1 > 0 and _sum2 > 0:
+                hausd = hd(np.expand_dims(pred_c_i, -1),
+                           np.expand_dims(gt_c_i, -1), voxel_size)
+            elif _sum1 + _sum2 > 0:
+                hausd = -1
+            else:
+                hausd = 0 # Correct (no annotation)
+
+            # Compute the ASSD
+            if _sum1 > 0 and _sum2 > 0:
+                surfdist = assd(np.expand_dims(pred_c_i, -1),
+                                np.expand_dims(gt_c_i, -1), 
+                                voxel_size)
+            elif _sum1 + _sum2 > 0:
+                surfdist = -1
+            else:
+                surfdist = 0 # Correct (no annotation)
+
+            res_z += [dice, jaccard, hausd, surfdist]
+
+        res_zs += [res_z]
+
+    return metrics(img_gt, img_pred, voxel_size), res_zs
+
+
+def compute_metrics_on_files(path_gt, path_pred):
+    """
+    Function to give the metrics for two files
+
+    Parameters
+    ----------
+
+    path_gt: string
+    Path of the ground truth image.
+
+    path_pred: string
+    Path of the predicted image.
+    """
+    gt, _, header = load_nii(path_gt)
+    pred, _, _ = load_nii(path_pred)
+    zooms = header.get_zooms()
+
+    name = os.path.basename(path_gt)
+    name = name.split('.')[0]
+    res = metrics(gt, pred, zooms)
+    res = ["{:.3f}".format(r) for r in res]
+
+    formatting = "{:>14}, {:>7}, {:>9}, {:>10}, {:>7}, {:>9}, {:>10}, {:>8}, {:>10}, {:>11}"
+    print(formatting.format(*HEADER))
+    print(formatting.format(name, *res))
+
+
+def compute_metrics_on_directories(dir_gt, dir_pred, ven):
+    """
+    Function to generate a csv file for each images of two directories.
+
+    Parameters
+    ----------
+
+    path_gt: string
+    Directory of the ground truth segmentation maps.
+
+    path_pred: string
+    Directory of the predicted segmentation maps.
+    """
+    info = pd.read_csv('utils/info.csv')
+    lst_pred = sorted(glob.glob(os.path.join(dir_pred, '**', '*sa_E?.nii.gz'), recursive=True), key=natural_order)
+    lst_gt = sorted(glob.glob(os.path.join(dir_gt, '**', '*sa_E?_gt.nii.gz'), recursive=True), key=natural_order)
+
+    res = []
+    res_zs = []
+    if len(lst_pred) != len(lst_gt):
+        pred_names = [os.path.basename(lp) for lp in lst_pred]
+        lst_gt = list(filter(lambda x: re.sub(r'\_gt', '', os.path.basename(x)) in pred_names, lst_gt))
+
+    for step, (p_gt, p_pred) in enumerate(zip(lst_gt, lst_pred)):
+        # print('> Evaluate image:', p_pred)
+        # print('  Against gt:', p_gt)
+
+        gt, _, header = load_nii(p_gt)
+        pred, _, _ = load_nii(p_pred)
+        zooms = header.get_zooms()
+
+        if np.max(pred) > 3:
+            pred = pred/np.max(pred)*3
+            pred = pred.astype(np.int8)
+        # Transpose if necessary
+        if gt.shape != pred.shape:
+            pred = np.swapaxes(pred, 0, 1)
+
+        res_n, res_zsn = metrics_slice(gt, pred, zooms)
+        code, _, edes = os.path.basename(p_gt).split('_')[:3]
+        vendor, centre = info[info['External code'] == code][['Vendor', 'Centre']].values[0]
+        res_tags = [edes, vendor, centre, *res_n]
+        print(f'Step[{step}] LV dice:{res_n[0]} MYO dice:{res_n[4]} RV dice:{res_n[8]}, code:{code}, edes:{edes} ven:{ven}')
+        # ipdb.set_trace()
+        res.append(res_tags)
+
+        res_zsn_tags = [edes, vendor, centre, *res_zsn]
+        res_zs.append(res_zsn_tags)
+
+
+    # Per-slice results
+    lst_name_gt = [os.path.basename(gt).split(".")[0] for gt in lst_gt]
+    new_res_zs = []
+    for j, rz in enumerate(res_zs):
+        for idx, z in enumerate(rz[3:]):
+            new_res_zs.append(
+                ['{}_z{}'.format(lst_name_gt[j], idx), *rz[:3], *z]
+            )
+
+    # dfd = pd.DataFrame(new_res_zs, columns=HEADER)
+    # dfd.to_csv(os.path.join(dir_pred, "results_detailed_{}.csv".format(time.strftime("%Y%m%d_%H%M"))), index=False)
+    # Per 3D volume results
+    lst_name_gt = [os.path.basename(gt).split(".")[0] for gt in lst_gt]
+    res = [[n,] + r for r, n in zip(res, lst_name_gt)]
+    # ipdb.set_trace()
+    df = pd.DataFrame(res, columns=HEADER)
+    row = df.shape[0]
+    df.loc[row, "Name"] = 'mean'
+    for para in HEADER[4:]:
+        df.loc[row, para] = df.loc[:row, para].mean()
+    
+    # df = df.drop(labels=["ED/ES","Vendor","Centre"],axis=1)
+    # df.to_csv(os.path.join('pred_output/res', "results_{}_{}.csv".format(ven, time.strftime("%Y%m%d_%H%M"))), index=False)
+    dice_lv = round(df.loc[row, "Dice LV"], 3)
+    dice_myo = round(df.loc[row, "Dice MYO"],3)
+    dice_rv = round(df.loc[row, "Dice RV"], 3)
+    print('mean:')
+    print(f'LV dice:{dice_lv} MYO dice:{dice_myo} RV dice:{dice_rv}')
+
+    # Anonymised df for participants
+    # adf = pd.read_csv(os.path.join(dir_pred, "results_{}.csv".format(time.strftime("%Y%m%d_%H%M"))))
+    # adf.sample(frac=1).iloc[:,1:].to_csv(os.path.join(dir_pred, "results_anonymized.csv"), index=False)
+
+    return [dice_lv, dice_myo, dice_rv]
+
+    # aux = ['', ' std']
+    # header_summary = [*HEADER[0], *np.asarray([[e, e + aux[i%2]] for e,i in enumerate(HEADER)]).flatten()]
+
+    # b = 4 # bias
+    # def getRow(auxdf, name):
+    #     aux = [name]
+    #     for i in range(b, auxdf.shape[1]):
+    #         aux.append(auxdf.iloc[:,i].mean())
+    #         aux.append(auxdf.iloc[:,i].std())
+    #     aux = [aux]
+
+    #     return aux
+
+    # summary = []
+    # summary.append(getRow(df, 'Total'))
+    # dfed = df[df['Name'].str.contains('_ED')]
+    # summary.append(getRow(dfed, 'ED'))
+    # dfes = df[df['Name'].str.contains('_ES')]
+    # summary.append(getRow(dfes, 'ES'))
+    # dfva = df[df['Vendor'] == 'A']
+    # summary.append(getRow(dfva, 'Vendor A'))
+    # dfvb = df[df['Vendor'] == 'B']
+    # summary.append(getRow(dfvb, 'Vendor B'))
+    # dfvc = df[df['Vendor'] == 'C']
+    # summary.append(getRow(dfvc, 'Vendor C'))
+    # dfvd = df[df['Vendor'] == 'D']
+    # summary.append(getRow(dfvd, 'Vendor D'))
+
+
+    # dfs = pd.DataFrame(summary, columns=header_summary)
+    # dfs.to_csv(os.path.join(dir_pred, "results_summary_{}.csv".format(time.strftime("%Y%m%d_%H%M%S"))), index=False)
+
+
+def main(path_gt, path_pred, ven):
+    """
+    Main function to select which method to apply on the input parameters.
+    """
+    if os.path.isfile(path_gt) and os.path.isfile(path_pred):
+        compute_metrics_on_files(path_gt, path_pred)
+    elif os.path.isdir(path_gt) and os.path.isdir(path_pred):
+        compute_metrics_on_directories(path_gt, path_pred, ven)
+    else:
+        raise ValueError("The paths given needs to be two directories or two files.")
+
+
+def plot_results(path_pred, model_name):
+    """
+    Plot results per slice, cardiac phase and label.
+    """
+    res_detail = sorted(list(glob.iglob(os.path.join(path_pred, 'results_detailed_????????_??????.csv'))))[-1]
+    detail = pd.read_csv(res_detail)
+    phases = list(set([d[2] for d in detail.Name.str.split('_')]))
+    detail['Phase'] = [d[2] for d in detail.Name.str.split('_')]
+    detail['Slice'] = [int(d[-1][1:]) for d in detail.Name.str.split('_')]
+    detail['Patient'] = [d[0] for d in detail.Name.str.split('_')]
+    mid_slice = detail.groupby('Patient').max()['Slice']//2
+    detail['RelSlice'] = 0
+    for i in mid_slice.index:
+        detail.loc[detail['Patient'] == i, 'RelSlice'] = detail[detail['Patient'] == i]['Slice'] - mid_slice[i]
+    detail['Patient_Phase'] = detail['Patient'] + '_' + detail['Phase']
+    detail['Average'] = detail['Mod Dice LV'] + detail['Mod Dice RV'] + detail['Mod Dice MYO']
+    detail['Position'] = 'Other'
+    detail['Group'] = 'Unknown'
+
+    for ph in phases:
+        for pat in detail.Patient.unique():
+            names = sorted(detail.query('Patient == "{}" and Phase == "{}"'.format(pat, ph)).Name)
+            if len(names) == 0:
+                continue
+            detail.loc[detail.Name == names[0], 'Position'] = 'Base'
+            nmid = names[len(names)//2]
+            detail.loc[detail.Name == nmid, 'Position'] = 'Middle'
+            detail.loc[detail.Name == names[-1], 'Position'] = 'Apex'
+
+    # Boxplot of all patients and slices
+    sns.set(style="ticks")
+    sns.set(rc={'figure.figsize': (16,15)})
+    paltt = ['m','g','y']
+    cases = ['LV', 'RV', 'MYO']
+    f, axes = plt.subplots(nrows=len(cases), ncols=len(phases), squeeze=False)
+    f.suptitle('Model {}'.format(model_name))
+    for j, ph in enumerate(phases):
+        axes[0,j].set_title(ph)
+        for i, case in enumerate(cases):
+            sns.boxplot(x="Group", y="Mod Dice {}".format(case), palette=paltt, hue='Position',
+                        data=detail.query("Phase == '{}' and Position != 'Other'".format(ph)),
+                        ax=axes[i,j])
+            sns.stripplot(x="Group", y="Mod Dice {}".format(case), palette=paltt, hue='Position',
+                        data=detail.query("Phase == '{}' and Position != 'Other'".format(ph)),
+                        ax=axes[i,j], dodge=True, linewidth=0.5)
+
+    f.savefig(os.path.join(path_pred, 'boxplots.pdf'))
+
+    # Lineplot of accuracy per slice relative to mid slice
+    f2, axes = plt.subplots(nrows=len(cases), ncols=len(phases), squeeze=False)
+    f2.suptitle('Model {}'.format(model_name))
+    for j, ph in enumerate(phases):
+        axes[0,j].set_title(ph)
+        for i, case in enumerate(cases):
+            sns.lineplot(x="RelSlice", y="Mod Dice {}".format(case), hue="Patient",
+                        data=detail.query("Phase == '{}'".format(ph)), ax=axes[i,j])
+            axes[i,j].set(xlabel='Distance to middle slice (negative is appex)', ylabel="Dice {}".format(case))
+
+    f2.savefig(os.path.join(path_pred, 'lineplots.pdf'))
+
+    detail.to_csv(os.path.join(path_pred, 'results_detailed_transformed.csv'))
+
+    # Clean seaborn plot styles
+    sns.set_style("white")
+
+
+if __name__ == "__main__":
+    # python metrics_mnms.py
+    # parser = argparse.ArgumentParser(
+    #     description="Script to compute M&Ms challenge metrics.")
+    # parser.add_argument("GT_IMG", type=str,
+    #                     default='/data/hxq/zd_code_data/data/mnms/Test/nii_data_ven/ven_A/label', help="Ground Truth image or folder")
+    # parser.add_argument("PRED_IMG", type=str,
+    #                     default='/pred_output/ven_A/image', help="Predicted image or folder")
+    # args = parser.parse_args()
+    # main(args.GT_IMG, args.PRED_IMG)
+
+    ven = 'D'
+    GT_IMG = f'/data/hxq/zd_code_data/data/mnms/Test/nii_data_ven/ven_{ven}/label'
+    num = 1
+    PRED_IMG = f'pred_output/ven_{ven}/image{str(num)}'
+    if ven == 'C':
+        print('C_dir')
+        PRED_IMG = f'pred_output/ven_{ven}/image{str(num+1)}'
+    main(GT_IMG, PRED_IMG, ven)
+    # for j in range(10,20):
+    #     res_all = []
+    #     num = j
+    #     print(j)
+    #     for v in ['A', 'B', 'C', 'D']:
+    #         ven = v
+    #         print(ven)
+    #         GT_IMG = f'/data/hxq/zd_code_data/data/mnms/Test/nii_data_ven/ven_{ven}/label'
+    #         PRED_IMG = f'pred_output/ven_{ven}/image{str(num)}'
+    #         if ven == 'C':
+    #             PRED_IMG = f'pred_output/ven_{ven}/image{str(num+1)}'
+    #         res = compute_metrics_on_directories(GT_IMG, PRED_IMG, ven)
+    #         res_avg = [sum(res)/3.0]
+    #         res_all += res_avg
+    #     res_all_avg = sum(res_all)/4.0
+    #     with open('style_distribution1.csv',"a") as csvfile: 
+    #         writer = csv.writer(csvfile)
+    #         if j == 0:
+    #             writer.writerow(["id","venA","venB","venC", "venD","average"])
+    #         writer.writerow([j,res_all[0],res_all[1],res_all[2], res_all[3], res_all_avg])        
